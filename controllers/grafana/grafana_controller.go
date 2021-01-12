@@ -14,37 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package controllers
+package grafana
 
 import (
 	"context"
 	stdErr "errors"
 	"fmt"
-	"github.com/go-logr/logr"
-	integreatlyorgv1alpha1 "github.com/integr8ly/grafana-operator/api/v1alpha1"
 	grafanav1alpha1 "github.com/integr8ly/grafana-operator/api/v1alpha1"
+	integreatlyorgv1alpha1 "github.com/integr8ly/grafana-operator/api/v1alpha1"
 	"github.com/integr8ly/grafana-operator/controllers/common"
 	"github.com/integr8ly/grafana-operator/v3/pkg/controller/config"
 	"github.com/integr8ly/grafana-operator/v3/pkg/controller/model"
-	routev1 "github.com/openshift/api/route/v1"
-	v12 "k8s.io/api/apps/v1"
-	v1 "k8s.io/api/core/v1"
-	v1beta12 "k8s.io/api/extensions/v1beta1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/record"
 	"reflect"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
-	"sigs.k8s.io/controller-runtime/pkg/source"
-)
 )
 
 const ControllerName = "grafana-controller"
@@ -52,9 +40,13 @@ const DefaultClientTimeoutSeconds = 5
 
 // GrafanaReconciler reconciles a Grafana object
 type GrafanaReconciler struct {
-	client.Client
-	Log    logr.Logger
-	Scheme *runtime.Scheme
+	client   client.Client
+	scheme   *runtime.Scheme
+	plugins  *PluginsHelperImpl
+	context  context.Context
+	cancel   context.CancelFunc
+	config   *config.ControllerConfig
+	recorder record.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=integreatly.org.integreatly.org,resources=grafanas,verbs=get;list;watch;create;update;patch;delete
@@ -72,7 +64,7 @@ type GrafanaReconciler struct {
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.7.0/pkg/reconcile
 func (r *GrafanaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	instance := &grafanav1alpha1.Grafana{}
-	err := r.client.Get(r.context, request.NamespacedName, instance)
+	err := r.client.Get(r.context, req.NamespacedName, instance)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			// Stop the dashboard controller from reconciling when grafana is not installed
@@ -94,30 +86,31 @@ func (r *GrafanaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	currentState := common.NewClusterState()
 	err = currentState.Read(r.context, cr, r.client)
 	if err != nil {
-		log.Error(err, "error reading state")
-		return r.manageError(cr, err, request)
+		log.Log.Error(err, "error reading state")
+		return r.manageError(cr, err, req), nil
 	}
 
 	// Get the actions required to reach the desired state
-	reconciler := NewGrafanaReconciler()
-	desiredState := reconciler.Reconcile(currentState, cr)
+	grafanaState := NewGrafanaState()
+	desiredState := grafanaState.getGrafanaDesiredState(currentState, cr)
 
 	// Run the actions to reach the desired state
 	actionRunner := common.NewClusterActionRunner(r.context, r.client, r.scheme, cr)
 	err = actionRunner.RunAll(desiredState)
 	if err != nil {
-		return r.manageError(cr, err, request)
+		return r.manageError(cr, err, req)
 	}
 
-	// Run the config map reconciler to discover jsonnet libraries
+	// Run the config map grafanaState to discover jsonnet libraries
 	err = reconcileConfigMaps(cr, r)
 	if err != nil {
-		return r.manageError(cr, err, request)
+		return r.manageError(cr, err, req)
 	}
 
-	return r.manageSuccess(cr, currentState, request)
+	return r.manageSuccess(cr, currentState, req)
 }
-func (r *ReconcileGrafana) manageError(cr *grafanav1alpha1.Grafana, issue error, request reconcile.Request) (reconcile.Result, error) {
+
+func (r *GrafanaReconciler) manageError(cr *grafanav1alpha1.Grafana, issue error, request reconcile.Request) (reconcile.Result, error) {
 	r.recorder.Event(cr, "Warning", "ProcessingError", issue.Error())
 	cr.Status.Phase = grafanav1alpha1.PhaseFailing
 	cr.Status.Message = issue.Error()
@@ -149,7 +142,7 @@ func (r *ReconcileGrafana) manageError(cr *grafanav1alpha1.Grafana, issue error,
 }
 
 // Try to find a suitable url to grafana
-func (r *ReconcileGrafana) getGrafanaAdminUrl(cr *grafanav1alpha1.Grafana, state *common.ClusterState) (string, error) {
+func (r *GrafanaReconciler) getGrafanaAdminUrl(cr *grafanav1alpha1.Grafana, state *common.ClusterState) (string, error) {
 	// If preferService is true, we skip the routes and try to access grafana
 	// by using the service.
 	preferService := false
@@ -193,7 +186,7 @@ func (r *ReconcileGrafana) getGrafanaAdminUrl(cr *grafanav1alpha1.Grafana, state
 	return "", stdErr.New("failed to find admin url")
 }
 
-func (r *ReconcileGrafana) manageSuccess(cr *grafanav1alpha1.Grafana, state *common.ClusterState, request reconcile.Request) (reconcile.Result, error) {
+func (r *GrafanaReconciler) manageSuccess(cr *grafanav1alpha1.Grafana, state *common.ClusterState, request reconcile.Request) (reconcile.Result, error) {
 	cr.Status.Phase = grafanav1alpha1.PhaseReconciling
 	cr.Status.Message = "success"
 
@@ -244,14 +237,14 @@ func (r *ReconcileGrafana) manageSuccess(cr *grafanav1alpha1.Grafana, state *com
 
 	common.ControllerEvents <- controllerState
 
-	log.V(1).Info("desired cluster state met")
+	log.Log.V(1).Info("desired cluster state met")
 
 	return reconcile.Result{RequeueAfter: config.RequeueDelay}, nil
 }
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *GrafanaReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&integreatlyorgv1alpha1.Grafana{}).
 		Complete(r)
 }
-
